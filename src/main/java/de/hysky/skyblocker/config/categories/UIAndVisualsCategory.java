@@ -56,6 +56,14 @@ public class UIAndVisualsCategory {
                         .controller(ConfigUtils::createBooleanController)
                         .build())
                 .option(Option.<Boolean>createBuilder()
+                        .name(Text.translatable("skyblocker.config.uiAndVisuals.preventUselessClicks"))
+                        .description(OptionDescription.of(Text.translatable("skyblocker.config.uiAndVisuals.preventUselessClicks.@Tooltip")))
+                        .binding(defaults.uiAndVisuals.preventUselessClicks,
+                                () -> config.uiAndVisuals.preventUselessClicks,
+                                newValue -> config.uiAndVisuals.preventUselessClicks = newValue)
+                        .controller(ConfigUtils::createBooleanController)
+                        .build())
+                .option(Option.<Boolean>createBuilder()
                         .name(Text.translatable("skyblocker.config.uiAndVisuals.fancyCraftingTable"))
                         .binding(defaults.uiAndVisuals.fancyCraftingTable,
                                 () -> config.uiAndVisuals.fancyCraftingTable,

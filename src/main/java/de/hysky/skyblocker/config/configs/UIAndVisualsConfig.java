@@ -22,6 +22,9 @@ public class UIAndVisualsConfig {
     public boolean hideEmptyTooltips = true;
 
     @SerialEntry
+    public boolean preventUselessClicks = true;
+
+    @SerialEntry
     public boolean fancyCraftingTable = true;
 
     @SerialEntry
