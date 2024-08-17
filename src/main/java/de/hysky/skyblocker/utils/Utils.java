@@ -6,9 +6,10 @@ import com.mojang.util.UndashedUuid;
 import de.hysky.skyblocker.events.SkyblockEvents;
 import de.hysky.skyblocker.mixins.accessors.MessageHandlerAccessor;
 import de.hysky.skyblocker.skyblock.item.MuseumItemCache;
-import de.hysky.skyblocker.utils.scheduler.Scheduler;
 import it.unimi.dsi.fastutil.objects.Object2IntOpenHashMap;
 import it.unimi.dsi.fastutil.objects.ObjectArrayList;
+import net.azureaaron.hmapi.data.rank.PackageRank;
+import net.azureaaron.hmapi.data.rank.RankType;
 import net.azureaaron.hmapi.data.server.Environment;
 import net.azureaaron.hmapi.events.HypixelPacketEvents;
 import net.azureaaron.hmapi.network.HypixelNetworking;
@@ -16,6 +17,7 @@ import net.azureaaron.hmapi.network.packet.s2c.ErrorS2CPacket;
 import net.azureaaron.hmapi.network.packet.s2c.HelloS2CPacket;
 import net.azureaaron.hmapi.network.packet.s2c.HypixelS2CPacket;
 import net.azureaaron.hmapi.network.packet.v1.s2c.LocationUpdateS2CPacket;
+import net.azureaaron.hmapi.network.packet.v1.s2c.PlayerInfoS2CPacket;
 import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.fabricmc.loader.api.FabricLoader;
@@ -27,14 +29,12 @@ import net.minecraft.text.MutableText;
 import net.minecraft.text.Text;
 import net.minecraft.util.Formatting;
 import net.minecraft.util.Util;
-import org.apache.http.client.HttpResponseException;
 import org.jetbrains.annotations.NotNull;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Instant;
 import java.util.Collections;
-import java.util.concurrent.CompletableFuture;
 
 /**
  * Utility variables and methods for retrieving Skyblock related information.
@@ -48,6 +48,11 @@ public class Utils {
     public static final String PROFILE_ID_PREFIX = "Profile ID: ";
     private static boolean isOnHypixel = false;
     private static boolean isOnSkyblock = false;
+    /**
+     * The player's rank.
+     */
+    @NotNull
+    private static RankType rank = PackageRank.NONE;
     /**
      * Current Skyblock location (from the Mod API)
      */
@@ -77,9 +82,6 @@ public class Utils {
     private static String locationRaw = "";
     @NotNull
     private static String map = "";
-    private static boolean mayorTickScheduled = false;
-    private static int mayorTickRetryAttempts = 0;
-    private static String mayor = "";
 
     /**
      * @implNote The parent text will always be empty, the actual text content is inside the text's siblings.
@@ -193,21 +195,14 @@ public class Utils {
     }
 
     /**
-     * @return the current mayor as cached on skyblock join.
+     * @return the player's rank
      */
     @NotNull
-    public static String getMayor() {
-        return mayor;
+    public static RankType getRank() {
+        return rank;
     }
 
     public static void init() {
-        SkyblockEvents.JOIN.register(() -> {
-            if (!mayorTickScheduled) {
-                tickMayorCache();
-                scheduleMayorTick();
-                mayorTickScheduled = true;
-            }
-        });
         ClientReceiveMessageEvents.ALLOW_GAME.register(Utils::onChatMessage);
         ClientReceiveMessageEvents.GAME_CANCELED.register(Utils::onChatMessage); // Somehow this works even though onChatMessage returns a boolean
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> onDisconnect());
@@ -216,6 +211,7 @@ public class Utils {
         HypixelNetworking.registerToEvents(Util.make(new Object2IntOpenHashMap<>(), map -> map.put(LocationUpdateS2CPacket.ID, 1)));
         HypixelPacketEvents.HELLO.register(Utils::onPacket);
         HypixelPacketEvents.LOCATION_UPDATE.register(Utils::onPacket);
+        HypixelPacketEvents.PLAYER_INFO.register(Utils::onPacket);
     }
 
     /**
@@ -395,6 +391,9 @@ public class Utils {
         switch (packet) {
             case HelloS2CPacket(var environment) -> {
                 Utils.environment = environment;
+
+                //Request the player's rank information
+                HypixelNetworking.sendPlayerInfoC2SPacket(1);
             }
 
             case LocationUpdateS2CPacket(var serverName, var serverType, var _lobbyName, var mode, var map) -> {
@@ -431,6 +430,10 @@ public class Utils {
                 }
 
                 LOGGER.error("[Skyblocker] Failed to update your current location! Some features of the mod may not work correctly :( - Error: {}", error);
+            }
+
+            case PlayerInfoS2CPacket(var playerRank, var packageRank, var monthlyPackageRank, var _prefix) -> {
+                rank = RankType.getEffectiveRank(playerRank, packageRank, monthlyPackageRank);
             }
 
             default -> {} //Do Nothing
@@ -494,44 +497,6 @@ public class Utils {
         }
 
         return true;
-    }
-
-    private static void scheduleMayorTick() {
-        long currentYearMillis = SkyblockTime.getSkyblockMillis() % 446400000L; //446400000ms is 1 year, 105600000ms is the amount of time from early spring 1st to late spring 27th
-        // If current time is past late spring 27th, the next mayor change is at next year's spring 27th, otherwise it's at this year's spring 27th
-        long millisUntilNextMayorChange = currentYearMillis > 105600000L ? 446400000L - currentYearMillis + 105600000L : 105600000L - currentYearMillis;
-        Scheduler.INSTANCE.schedule(Utils::tickMayorCache, (int) (millisUntilNextMayorChange / 50) + 5 * 60 * 20); // 5 extra minutes to allow the cache to expire. This is a simpler than checking age and subtracting from max age and rescheduling again.
-    }
-
-    private static void tickMayorCache() {
-        CompletableFuture.supplyAsync(() -> {
-            try {
-                Http.ApiResponse response = Http.sendCacheableGetRequest("https://api.hypixel.net/v2/resources/skyblock/election", null); //Authentication is not required for this endpoint
-                if (!response.ok()) throw new HttpResponseException(response.statusCode(), response.content());
-                JsonObject json = JsonParser.parseString(response.content()).getAsJsonObject();
-                if (!json.get("success").getAsBoolean()) throw new RuntimeException("Request failed!"); //Can't find a more appropriate exception to throw here.
-                return json.get("mayor").getAsJsonObject().get("name").getAsString();
-            } catch (Exception e) {
-                throw new RuntimeException(e); //Wrap the exception to be handled by the exceptionally block
-            }
-        }).exceptionally(throwable -> {
-            LOGGER.error("[Skyblocker] Failed to get mayor status!", throwable.getCause());
-            if (mayorTickRetryAttempts < 5) {
-                int minutes = 5 << mayorTickRetryAttempts; //5, 10, 20, 40, 80 minutes
-                mayorTickRetryAttempts++;
-                LOGGER.warn("[Skyblocker] Retrying in {} minutes.", minutes);
-                Scheduler.INSTANCE.schedule(Utils::tickMayorCache, minutes * 60 * 20);
-            } else {
-                LOGGER.warn("[Skyblocker] Failed to get mayor status after 5 retries! Stopping further retries until next reboot.");
-            }
-            return ""; //Have to return a value for the thenAccept block.
-        }).thenAccept(result -> {
-            if (!result.isEmpty()) {
-                mayor = result;
-                LOGGER.info("[Skyblocker] Mayor set to {}.", mayor);
-                scheduleMayorTick(); //Ends up as a cyclic task with finer control over scheduled time
-            }
-        });
     }
 
     /**
